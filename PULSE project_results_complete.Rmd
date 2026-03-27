@@ -1,0 +1,915 @@
+**Load packages**
+```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+library(dplyr)
+library(tidyr)
+library(stringr)
+install.packages("googlesheets4")
+library(googlesheets4)
+library(nnet)
+library(ggplot2)
+
+```
+**Prepare for GPA**
+```{r}
+library(readxl)
+
+
+file_path <- "/Users/fuyitong/Library/Containers/com.microsoft.Outlook/Data/tmp/Outlook Temp/umbc_grades[4].xlsx"
+
+
+dfgpa <- read_excel(file_path)
+
+```
+
+```{r}
+library(dplyr)
+
+#letter grades to quality points (from University web)
+dfgpa <- dfgpa %>%
+  mutate(QualityPoints = case_when(
+    Grade == "A" ~ 4,
+    Grade == "B" ~ 3,
+    Grade == "C" ~ 2,
+    Grade == "D" ~ 1,
+    Grade == "F" ~ 0,
+    TRUE ~ NA_real_
+  ))
+
+dfgpa$EmployeeID <- as.character(dfgpa$EmployeeID)
+
+#first 3 unique terms per student
+df_first3terms <- dfgpa %>%
+  group_by(EmployeeID) %>%
+  mutate(term_rank = dense_rank(Term)) %>%
+  filter(term_rank <= 3) %>%
+  ungroup()
+
+#filter NA (Pass Fail Grades)
+df_gpa_terms_3 <- df_first3terms %>%
+  filter(!is.na(QualityPoints))
+
+
+#calculate cumulative GPA 3 semesters
+student_gpa_3 <- df_gpa_terms_3 %>%
+  group_by(EmployeeID) %>%
+  summarise(
+    total_quality_points_3term = sum(QualityPoints * CreditsAttempted, na.rm = TRUE),
+    total_credits_3term = sum(CreditsAttempted, na.rm = TRUE),
+    avg_gpa_3term = total_quality_points_3term / total_credits_3term
+  ) %>%
+  ungroup()
+
+#first 2 unique terms per student
+df_first2terms <- dfgpa %>%
+  group_by(EmployeeID) %>%
+  mutate(term_rank = dense_rank(Term)) %>%
+  filter(term_rank <= 1) %>% ##1 represents the first 2 semesters, 1 represent the first semester
+  ungroup()
+
+df_gpa_terms_2 <- df_first2terms %>%
+  filter(!is.na(QualityPoints))
+
+#calculate cumulative GPA 2 semesters
+student_gpa_2 <- df_gpa_terms_2 %>%
+  group_by(EmployeeID) %>%
+  summarise(
+    total_quality_points_2term = sum(QualityPoints * CreditsAttempted, na.rm = TRUE),
+    total_credits_2term = sum(CreditsAttempted, na.rm = TRUE),
+    gpa_2term = total_quality_points_2term / total_credits_2term
+  ) %>%
+  ungroup()
+
+#combine
+student_gpa <- student_gpa_3 %>%
+  left_join(student_gpa_2, by = "EmployeeID")
+
+student_gpa
+
+#check NAs
+sum(is.na(student_gpa))
+
+```
+```{r}
+install.packages("writexl")
+library(writexl)
+
+write_xlsx(student_gpa, path = "/Users/fuyitong/Documents/PULSE Summer Project/student_gpa_first3terms.xlsx")
+
+```
+
+```{r}
+dflist <- read.csv("/Users/fuyitong/Library/Containers/com.microsoft.Outlook/Data/tmp/Outlook Temp/idlist.csv")  
+```
+
+**Read csv**
+
+```{r}
+df <- read.csv("https://uwmadison.box.com/shared/static/fbt91lylf2ue0kmlylug2c56sceebjk8.csv")
+
+head(df)
+
+```
+
+**Merge GPA into the main df**
+```{r}
+dflist <- dflist %>%
+  mutate(
+    StudentID = as.character(StudentID),
+    EmployeeID = as.character(EmployeeID)
+  )
+
+student_gpa <- student_gpa %>%
+  mutate(EmployeeID = as.character(EmployeeID))
+
+df <- df %>%
+  mutate(StudentID = as.character(StudentID))
+
+
+dflist <- dflist %>%
+  left_join(student_gpa, by = "EmployeeID")
+
+
+df <- df %>%
+  left_join(dflist, by = "StudentID")
+
+
+head(df)
+
+sum(is.na(df$avg_gpa_3term))
+sum(is.na(df$gpa_2term))
+na_rows <- df[is.na(df$avg_gpa_3term), ]
+na_rows[, c("StudentID", "EmployeeID", "total_quality_points_3term", "total_credits_3term")]
+df <- df[!is.na(df$avg_gpa_3term), ]
+```
+
+**Code and check independent variables**
+```{r}
+df$Female <- ifelse(df$Female == "Female", 1, 0)   
+df$URM    <- ifelse(df$URM == "URM", 1, 0)  
+df$FG     <- ifelse(df$FG == "FG", 1, 0)
+
+table(df$FG)
+table(df$URM)
+table(df$Female)
+table(df$URM, df$Female)
+
+sum(is.na(df$Female))
+sum(is.na(df$URM))
+sum(is.na(df$FG))
+#since there is an NA both in FG and Female, drop these two data
+df <- df %>%
+  filter(!is.na(Female) & !is.na(FG))
+
+```
+
+**Find original and final major**
+```{r}
+semester_order <- c(
+  "fa17", "wi18", "sp18", "su18", 
+  "fa18", "wi19", "sp19", "su19",
+  "fa19", "wi20", "sp20", "su20", 
+  "fa20", "wi21", "sp21", "su21", 
+  "fa21", "wi22", "sp22", "su22", 
+  "fa22", "wi23", "sp23", "su23", 
+  "fa23", "wi24", "sp24", "su24", 
+  "fa24"
+)
+plan_cols <- grep("^plan_", names(df), value = TRUE)
+
+term_labels <- sub("^plan_", "", plan_cols)
+ordered_plan_cols <- plan_cols[order(match(term_labels, semester_order))]
+
+df$original_major <- NA
+df$final_major <- NA
+
+for (i in 1:nrow(df)) {
+  df$Semester <- tolower(gsub("^F", "fa", df$Semester))
+  enter_sem <- df$Semester[i]
+  original_col <- paste0("plan_", enter_sem)
+  completion_sem <- df$completion_term[i]
+  final_col <- paste0("plan_", completion_sem)
+  
+  plan_values <- df[i, ordered_plan_cols]
+  non_na <- plan_values[!is.na(plan_values)]
+  
+  if (original_col %in% names(df)) {
+    major <- df[i, original_col]
+    if (!is.na(major)) {
+      df$original_major[i] <- major
+    } else if (length(non_na) > 0) {
+      df$original_major[i] <- head(non_na, 1)
+    }
+  } else if (length(non_na) > 0) {
+    df$original_major[i] <- head(non_na, 1)
+  }
+  
+  if (final_col %in% names(df)) {
+    major_final <- df[i, final_col]
+    if (!is.na(major_final)) {
+      df$final_major[i] <- major_final
+    } else if (length(non_na) > 0) {
+      df$final_major[i] <- tail(non_na, 1)
+    }
+  } else if (length(non_na) > 0) {
+    df$final_major[i] <- tail(non_na, 1)
+  }
+}
+
+df[is.na(df$original_major), ]
+df[is.na(df$final_major), ] #these two are dropped when dropping uncodable original&final major STEM requirements
+
+```
+
+
+```{r}
+head(df[, c("StudentID", "URM", "Female", "Semester", "original_major", "final_major")])
+
+```
+
+**Read stem requirement google sheet**
+
+```{r}
+sheet_url <- "https://docs.google.com/spreadsheets/d/1uddE0gpDYKFG2TNGv6QyUkmu9nyHybNmg0Qfz5mu_CI/edit?usp=sharing"
+
+sheet_names(sheet_url)
+gs4_auth()
+stem_req <- read_sheet(sheet_url, sheet = "Coding")
+
+
+```
+
+**Code original and final major stem requirement**
+
+```{r}
+df$original_stem_req <- NA
+df$final_stem_req <- NA
+
+for (i in 1:nrow(df)) {
+  major1 <- df$original_major[i]
+  major2 <- df$final_major[i]
+
+  #original major STEM req
+  if (!is.na(major1)) {
+    row_index <- which(stem_req$Plan == major1)
+    if (length(row_index) > 0) {
+      df$original_stem_req[i] <- stem_req[[ "STEM credits requirements" ]][row_index[1]]
+    }
+  }
+
+  #final major STEM req
+  if (!is.na(major2)) {
+    row_index <- which(stem_req$Plan == major2)
+    if (length(row_index) > 0) {
+      df$final_stem_req[i] <- stem_req[[ "STEM credits requirements" ]][row_index[1]]
+    }
+  }
+}
+
+df$stem_req_change <- df$final_stem_req - df$original_stem_req
+
+
+```
+
+
+
+
+**Standardize/clean majors to take care of the pre tracks**
+```{r}
+standardize_major <- function(major) {
+  major <- tolower(major)
+  major <- gsub("^pre-+", "", major)
+  major <- trimws(major)
+  
+  #add "- bs" for pre majors to match their counterparts
+  bs_majors <- c(
+    "mechanical engineering",
+    "chemical engineering",
+    "computer engineering",
+    "computer science"
+  )
+  
+  major <- ifelse(major %in% bs_majors, paste0(major, " - bs"), major)
+  
+  return(major)
+}
+
+#apply to both datasets
+df$original_major_clean <- standardize_major(df$original_major)
+df$final_major_clean <- standardize_major(df$final_major)
+stem_req$Plan_clean <- standardize_major(stem_req$Plan)
+
+```
+
+**Check NAs**
+
+```{r}
+df$stem_req_change <- df$final_stem_req - df$original_stem_req
+df_na <- df[is.na(df$stem_req_change), c("original_major", "final_major")]
+df_na
+
+df <- df[!is.na(df$stem_req_change), ]
+
+```
+
+
+
+**Code whether or not a student switched major**
+```{r}
+df$switched_major <- ifelse(
+  df$original_major_clean != df$final_major_clean, 
+  1, 0
+)
+
+print(df[1:20, c("original_major_clean", "final_major_clean", "switched_major")])
+
+
+```
+
+**Code whether or not a student switched from a stem to nonstem major**
+```{r}
+df$original_stem <- NA
+df$final_stem <- NA
+
+for (i in 1:nrow(df)) {
+  major1 <- df$original_major_clean[i]
+  major2 <- df$final_major_clean[i]
+  
+  match1 <- stem_req$stem[stem_req$Plan_clean == major1][1]
+  match2 <- stem_req$stem[stem_req$Plan_clean == major2][1]
+  
+  df$original_stem[i] <- match1
+  df$final_stem[i] <- match2
+}
+
+df$stem_to_nonstem <- ifelse(
+  !is.na(df$original_stem) &
+  !is.na(df$final_stem) &
+  df$original_stem == "yes" &
+  df$final_stem == "no",
+  1,  
+  0
+)
+  
+df$nonstem_to_stem <- ifelse(
+  !is.na(df$original_stem) &
+  !is.na(df$final_stem) &
+  df$original_stem == "no" &
+  df$final_stem == "yes",
+  1,  
+  0   
+)
+
+df$stem_to_stem <- ifelse(
+  !is.na(df$original_stem) &
+  !is.na(df$final_stem) &
+  df$original_stem == "yes" &
+  df$final_stem == "yes",
+  1,  
+  0  
+)
+
+df$nonstem_to_nonstem <- ifelse(
+  !is.na(df$original_stem) &
+  !is.na(df$final_stem) &
+  df$original_stem == "no" &
+  df$final_stem == "no",
+  1,  
+  0   
+)
+
+sum(df$stem_to_nonstem == 1, na.rm = TRUE)
+sum(df$nonstem_to_stem == 1, na.rm = TRUE)
+sum(df$stem_to_stem == 1, na.rm = TRUE)
+sum(df$nonstem_to_nonstem == 1, na.rm = TRUE)
+
+
+df_stem_students <- df[df$original_stem == "yes",]
+df_stem_students$stem_to_nonstem <- ifelse(
+  !is.na(df_stem_students$original_stem) &
+  !is.na(df_stem_students$final_stem) &
+  df_stem_students$original_stem == "yes" &
+  df_stem_students$final_stem == "no",
+  1,  
+  0
+)
+
+```
+
+**Code students' changing department/school status**
+```{r}
+df$original_dept <- NA
+df$final_dept <- NA
+df$original_college <- NA
+df$final_college <- NA
+
+for (i in 1:nrow(df)) {
+  major1 <- df$original_major_clean[i]
+  major2 <- df$final_major_clean[i]
+  
+  match1 <- stem_req[stem_req$Plan_clean == major1, ]
+  if (nrow(match1) > 0) {
+    df$original_dept[i] <- match1$Department[1]
+    df$original_college[i] <- match1$College[1]
+  }
+  
+  match2 <- stem_req[stem_req$Plan_clean == major2, ]
+  if (nrow(match2) > 0) {
+    df$final_dept[i] <- match2$Department[1]
+    df$final_college[i] <- match2$College[1]
+  }
+}
+
+#change type
+df$change_type <- NA
+
+for (i in 1:nrow(df)) {
+  if (is.na(df$original_dept[i]) | is.na(df$final_dept[i])) {
+    df$change_type[i] <- NA
+  } else if (df$original_major_clean[i] == df$final_major_clean[i]) {
+    df$change_type[i] <- "No Change"
+  } else if (df$original_dept[i] == df$final_dept[i]) {
+    df$change_type[i] <- "Same Department"
+  } else if (!is.na(df$original_college[i]) & !is.na(df$final_college[i]) &
+             df$original_college[i] == df$final_college[i]) {
+    df$change_type[i] <- "Different Department (Same College)"
+  } else if (!is.na(df$original_college[i]) & !is.na(df$final_college[i])) {
+    df$change_type[i] <- "Different College"
+  } else {
+    df$change_type[i] <- NA
+  }
+}
+
+```
+
+
+**Convert change_type to scores**
+```{r}
+df$change_score <- NA
+
+df$change_score[df$change_type == "No Change"] <- 0
+df$change_score[df$change_type == "Same Department"] <- 1
+df$change_score[df$change_type == "Different Department (Same College)"] <- 2
+df$change_score[df$change_type == "Different College"] <- 3
+
+#inspect students with different change score
+df[df$change_score == 1,c("original_major_clean", "final_major_clean")]
+df[df$change_score == 2,c("original_major_clean", "final_major_clean")]
+df[df$change_score == 3,c("original_major_clean", "final_major_clean")]
+
+```
+
+**Inspect dependent variables**
+
+```{r}
+n_total <- nrow(df)
+
+outcome_summary <- data.frame(
+  Variable = c("switched_major", "stem_req_change", "change_score", "stem_to_nonstem"),
+  Mean = c(
+    mean(df$switched_major, na.rm = TRUE),
+    mean(df$stem_req_change, na.rm = TRUE),
+    mean(df$change_score, na.rm = TRUE),
+    mean(df$stem_to_nonstem, na.rm = TRUE)
+  ),
+  SD = c(
+    sd(df$switched_major, na.rm = TRUE),
+    sd(df$stem_req_change, na.rm = TRUE),
+    sd(df$change_score, na.rm = TRUE),
+    sd(df$stem_to_nonstem, na.rm = TRUE)
+  ),
+  Min = c(
+    min(df$switched_major, na.rm = TRUE),
+    min(df$stem_req_change, na.rm = TRUE),
+    min(df$change_score, na.rm = TRUE),
+    min(df$stem_to_nonstem, na.rm = TRUE)
+  ),
+  Max = c(
+    max(df$switched_major, na.rm = TRUE),
+    max(df$stem_req_change, na.rm = TRUE),
+    max(df$change_score, na.rm = TRUE),
+    max(df$stem_to_nonstem, na.rm = TRUE)
+  ),
+  N_Observed = c(
+    sum(!is.na(df$switched_major)),
+    sum(!is.na(df$stem_req_change)),
+    sum(!is.na(df$change_score)),
+    sum(!is.na(df$stem_to_nonstem))
+  ),
+  N_Missing = c(
+    sum(is.na(df$switched_major)),
+    sum(is.na(df$stem_req_change)),
+    sum(is.na(df$change_score)),
+    sum(is.na(df$stem_to_nonstem))
+  )
+)
+
+outcome_summary$Missing_Pct <- round(100 * outcome_summary$N_Missing / n_total, 1)
+
+outcome_summary
+
+
+table(df$switched_major)
+table(df$stem_to_nonstem)
+
+```
+
+
+```{r}
+library(ggplot2)
+
+#stem_req_change outcome check
+ggplot(df, aes(x = stem_req_change)) +
+  geom_histogram(bins = 30, fill = "#69b3a2", color = "white") +
+  labs(title = "Distribution of stem_req_change",
+       x = "stem_req_change", y = "Count") +
+  theme_minimal()
+
+#change_score
+ggplot(df, aes(x = change_score)) +
+  geom_histogram(bins = 30, fill = "#404080", color = "white") +
+  labs(title = "Distribution of change_score",
+       x = "change_score", y = "Count") +
+  theme_minimal()
+
+
+```
+
+```{r}
+#switched_major
+ggplot(df, aes(x = factor(switched_major))) +
+  geom_bar(fill = "#F8766D") +
+  labs(title = "Distribution of switched_major",
+       x = "switched_major (0/1)", y = "Count") +
+  theme_minimal()
+
+#stem_to_nonstem
+ggplot(df, aes(x = factor(stem_to_nonstem))) +
+  geom_bar(fill = "#00BFC4") +
+  labs(title = "Distribution of stem_to_nonstem",
+       x = "stem_to_nonstem (0/1)", y = "Count") +
+  theme_minimal()
+
+```
+
+
+**Predicting whether or not a student switched major**
+
+```{r}
+
+#main effects
+model1_main <- glm(switched_major ~ Female + URM + avg_gpa_3term + FG, 
+                   data = df, family = "binomial")
+summary(model1_main)
+roubustness1_main <- glm(switched_major ~ Female + URM + gpa_2term + FG, 
+                   data = df, family = "binomial")
+summary(roubustness1_main)
+
+#added interaction
+model1 <- glm(switched_major ~  Female * URM + Female * FG + URM * FG + avg_gpa_3term, data = df, family = "binomial")
+summary(model1)
+
+roubustness1 <- glm(switched_major ~  Female * URM + Female * FG + URM * FG + gpa_2term, data = df, family = "binomial")
+summary(roubustness1)
+```
+
+```{r}
+#main effects
+model2_main <- lm(stem_req_change ~ Female + URM + FG + avg_gpa_3term, data = df)
+summary(model2_main)
+
+roubustness2_main <- lm(stem_req_change ~ Female + URM + FG + gpa_2term, data = df)
+summary(roubustness2_main)
+
+#added interaction effects
+model2 <- lm((stem_req_change) ~  Female * URM + Female * FG + URM * FG + avg_gpa_3term, data = df)
+summary(model2)
+
+roubustness2 <- lm((stem_req_change) ~  Female * URM + Female * FG + URM * FG + gpa_2term, data = df)
+summary(roubustness2)
+
+
+```
+```{r}
+#focus on students who change their major
+df_changed <- subset(df, stem_req_change != 0)
+model2_changed <- lm(stem_req_change ~ Female * URM + Female * FG + URM * FG + avg_gpa_3term, data = df_changed)
+summary(model2_changed)
+
+```
+
+
+```{r}
+#main effects
+model3_main <- lm(change_score ~ Female + URM + FG + avg_gpa_3term, data = df)
+summary(model3_main)
+
+roubustness3_main <- lm(change_score ~ Female + URM + FG + gpa_2term, data = df)
+summary(roubustness3_main)
+
+#interaction added
+model3 <- lm(change_score ~ Female * URM + Female * FG + URM * FG + avg_gpa_3term, data = df)
+summary(model3)
+
+robustness3 <- lm(change_score ~ Female * URM + Female * FG + URM * FG + gpa_2term, data = df)
+summary(robustness3)
+
+#focus on students who changed their major
+df_nonzero <- subset(df, change_score != 0)
+model3_main <- lm(change_score ~ Female * URM + Female * FG + URM * FG + avg_gpa_3term, data = df_nonzero)
+summary(model3_main)
+
+```
+
+```{r}
+#main effects
+model4_main <- glm(stem_to_nonstem ~ Female + URM + FG + avg_gpa_3term, family = "binomial", data = df)
+summary(model4_main)
+
+robustness4_main <- glm(stem_to_nonstem ~ Female + URM + FG + gpa_2term, family = "binomial", data = df)
+summary(robustness4_main)
+
+#interaction added
+model4 <- glm(formula = stem_to_nonstem ~ Female * URM + FG * URM + FG * Female + avg_gpa_3term, family = "binomial", data = df)
+
+summary(model4)
+
+robustness4 <- glm(formula = stem_to_nonstem ~ Female * URM + FG * URM + FG * Female + gpa_2term, family = "binomial", data = df)
+
+summary(robustness4)
+
+#focus on stem students
+model4_stemstudents <- glm(formula = stem_to_nonstem ~ Female * URM + FG * URM + FG * Female + avg_gpa_3term, family = "binomial", data = df_stem_students)
+summary(model4_stemstudents)
+```
+```{r}
+#predict using model
+df$predicted <- predict(model2, newdata = df)
+
+#recode feamle and URM
+df$Female_label <- ifelse(df$Female == 1, "Female",
+                     ifelse(df$Female == 0, "Male", NA))
+df$URM_label    <- ifelse(df$URM == 1, "URM",
+                     ifelse(df$URM == 0, "Not URM", NA))
+
+
+
+df_summary_pred <- df %>%
+  group_by(Female_label, URM_label) %>%
+  summarise(
+    predicted_mean = mean(abs(predicted), na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+
+ggplot(df_summary_pred, aes(x = Female_label, y = predicted_mean, fill = URM_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Model-Predicted Interaction: Female × URM",
+    x = "Sex",
+    y = "Change in STEM Credits (abs value)",
+    fill = "URM Status"
+  ) +
+  theme_minimal()
+
+
+male_urm_pred <- df_summary_pred %>%
+  filter(Female_label == "Male", URM_label == "URM") %>%
+  pull(predicted_mean)
+
+female_urm_pred <- df_summary_pred %>%
+  filter(Female_label == "Female", URM_label == "URM") %>%
+  pull(predicted_mean)
+
+difference <- male_urm_pred - female_urm_pred
+difference
+
+```
+**read csv**
+```{r}
+library(readr)
+survey <- read_csv("/Users/fuyitong/Documents/PULSE Summer Project/umbc_survey_data.csv")
+```
+**merge demographic info**
+```{r}
+# merge demographic info (FG, Female, URM) from df into survey by StudentID
+survey <- survey %>%
+  left_join(df %>% select(StudentID, FG, Female, URM), by = "StudentID")
+
+
+```
+
+**filter the data that are not available in df**
+```{r}
+
+survey <- survey %>%
+  filter(!is.na(FG) & !is.na(Female) & !is.na(URM))
+
+```
+**check the number of URM female students**
+```{r}
+
+table(survey$URM, survey$Female)
+```
+**drop NAs**
+```{r}
+#the results show that for the first 15 plan_models 5 data are missing - check these data and filter out
+missing_rows <- survey %>%
+  filter(is.na(why_plans_1) | is.na(Female) | is.na(URM) | is.na(FG))
+
+nrow(missing_rows)
+
+
+missing_rows[, c("FG", "URM", "why_plans_1")]
+
+
+survey_filtered <- survey %>%
+  filter(!is.na(why_plans_2) & !is.na(Female) & !is.na(URM) & !is.na(FG))
+```
+
+**drop NAs**
+```{r}
+#the results show that 83 data are still missing for plan_model 16, 17, and 18, so check these data and drop them for the three models
+missing_rows <- survey %>%
+  filter(is.na(why_plans_18) | is.na(Female) | is.na(URM) | is.na(FG))
+
+nrow(missing_rows)
+
+
+missing_rows
+
+
+survey_filtered_2 <- survey %>%
+  filter(!is.na(why_plans_16) & !is.na(Female) & !is.na(URM) & !is.na(FG))
+```
+**build main effect models**
+```{r}
+
+model_plan_1 <- lm(why_plans_1 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_1)
+
+model_plan_2 <- lm(why_plans_2 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_2)
+
+model_plan_3 <- lm(why_plans_3 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_3)
+
+model_plan_4 <- lm(why_plans_4 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_4)
+
+model_plan_5 <- lm(why_plans_5 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_5)
+
+model_plan_6 <- lm(why_plans_6 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_6)
+
+model_plan_7 <- lm(why_plans_7 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_7)
+
+model_plan_8 <- lm(why_plans_8 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_8)
+
+model_plan_9 <- lm(why_plans_9 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_9)
+
+model_plan_10 <- lm(why_plans_10 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_10)
+
+model_plan_11 <- lm(why_plans_11 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_11)
+
+model_plan_12 <- lm(why_plans_12 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_12)
+
+model_plan_13 <- lm(why_plans_13 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_13)
+
+model_plan_14 <- lm(why_plans_14 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_14)
+
+model_plan_15 <- lm(why_plans_15 ~ Female + URM + FG, data = survey_filtered)
+summary(model_plan_15)
+
+model_plan_16 <- lm(why_plans_16 ~ Female + URM + FG, data = survey_filtered_2)
+summary(model_plan_16)
+
+model_plan_17 <- lm(why_plans_17 ~ Female + URM + FG, data = survey_filtered_2)
+summary(model_plan_17)
+
+model_plan_18 <- lm(why_plans_18 ~ Female + URM + FG, data = survey_filtered_2)
+summary(model_plan_18)
+
+```
+
+**build modles with interaction terms**
+```{r}
+model1 <- lm(why_plans_1 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model1)
+
+model2 <- lm(why_plans_2 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model2)
+
+model3 <- lm(why_plans_3 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model3)
+
+model4 <- lm(why_plans_4 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model4)
+
+model5 <- lm(why_plans_5 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model5)
+
+model6 <- lm(why_plans_6 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model6)
+
+model7 <- lm(why_plans_7 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model7)
+
+model8 <- lm(why_plans_8 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model8)
+
+model9 <- lm(why_plans_9 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model9)
+
+model10 <- lm(why_plans_10 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model10)
+
+model11 <- lm(why_plans_11 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model11)
+
+model12 <- lm(why_plans_12 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model12)
+
+model13 <- lm(why_plans_13 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model13)
+
+model14 <- lm(why_plans_14 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model14)
+
+model15 <- lm(why_plans_15 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered)
+summary(model15)
+
+model16 <- lm(why_plans_16 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered_2)
+summary(model16)
+
+model17 <- lm(why_plans_17 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered_2)
+summary(model17)
+
+model18 <- lm(why_plans_18 ~ Female + URM + FG + Female * URM + Female * FG + URM * FG, data = survey_filtered_2)
+summary(model18)
+```
+
+```{r}
+
+new_data <- expand.grid(
+  Female = c(0, 1),
+  URM = c(0, 1),
+  FG = mean(survey_filtered$FG, na.rm = TRUE)  # hold FG constant
+)
+
+new_data$predicted <- predict(model6, newdata = new_data)
+
+new_data <- new_data %>%
+  mutate(
+    Female_label = ifelse(Female == 1, "Female", "Male"),
+    URM_label = ifelse(URM == 1, "URM", "Non-URM")
+  )
+
+ggplot(new_data, aes(x = URM_label, y = predicted, fill = Female_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Interaction Effect of Female and URM on why_plans_6 (help other people)",
+    x = "URM Status",
+    y = "Predicted why_plans_6",
+    fill = "Gender"
+  ) +
+  theme_minimal()
+```
+```{r}
+new_data9 <- expand.grid(
+  Female = c(0, 1),
+  URM = c(0, 1),
+  FG = mean(survey_filtered$FG, na.rm = TRUE)  # hold FG constant
+)
+
+new_data9$predicted <- predict(model9, newdata = new_data9)
+
+
+new_data9 <- new_data9 %>%
+  mutate(
+    Female_label = ifelse(Female == 1, "Female", "Male"),
+    URM_label = ifelse(URM == 1, "URM", "Non-URM")
+  )
+
+
+ggplot(new_data9, aes(x = URM_label, y = predicted, fill = Female_label)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Interaction Effect of Female and URM on why_plans_9 (make contribution to society)",
+    x = "URM Status",
+    y = "Predicted Value",
+    fill = "Gender"
+  ) +
+  theme_minimal()
+```
+
